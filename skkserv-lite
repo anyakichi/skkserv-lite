@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+__version__ = '1.0'
+
+
+import argparse
+import collections
+import os
+import select
+import socket
+import sqlite3
+import sys
+import threading
+
+try:
+    import grp
+    import pwd
+except ImportError:
+    grp = None
+    pwd = None
+
+try:
+    import daemon
+    import lockfile.pidlockfile
+except ImportError:
+    daemon = None
+    lockfile = None
+
+
+def create_table(conn):
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE jisyo (
+            id INTEGER PRIMARY KEY,
+            key TEXT,
+            candidate TEXT,
+            annotation TEXT,
+            okuri_ari BOOL
+        );
+    """);
+
+    cur.execute("""
+        CREATE INDEX keyidx ON jisyo(key);
+    """);
+
+    conn.commit()
+    cur.close()
+
+
+def lookup(candidates, conn, key):
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT candidate, annotation from jisyo WHERE key = ?;
+    """, (key,))
+
+    for (cand, anno) in cur:
+        if cand not in candidates:
+            candidates[cand] = []
+        if anno != '' and anno not in candidates[cand]:
+            candidates[cand].append(anno)
+
+    cur.close()
+
+
+def lookup_complete_candidates(candidates, conn, key):
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT DISTINCT key FROM jisyo WHERE key GLOB ? AND okuri_ari = 0;
+    """, (key + '*',))
+
+    for (cand,) in cur:
+        if cand not in candidates:
+            candidates.append(cand)
+
+    cur.close()
+
+
+def cand2str(cand, annos):
+    if annos:
+        return cand + ';' + ','.join(annos)
+    else:
+        return cand
+
+
+def skkserv_cmd1(conns, line):
+    if not line.endswith(' '):
+        return '0' + line
+
+    key = line[:-1]
+
+    candidates = collections.OrderedDict()
+    for conn in conns:
+        lookup(candidates, conn, key)
+
+    if not candidates:
+        return '4' + key
+
+    result = '/'.join([cand2str(k, v) for (k, v) in candidates.iteritems()])
+
+    return '1/' + result + '/'
+
+
+def skkserv_cmd4(conns, line):
+    if not line.endswith(' '):
+        return '0' + line
+
+    key = line[:-1]
+
+    candidates = []
+    for conn in conns:
+        lookup_complete_candidates(candidates, conn, key)
+
+    if not candidates:
+        return '4' + key
+
+    result = '/'.join(candidates)
+
+    return '1/' + result + '/'
+
+
+def skkserv_main(read, write, files, version, host_info):
+    conns = []
+
+    try:
+        for f in files:
+            conn = sqlite3.connect(f)
+            conns.append(conn)
+
+        while True:
+            try:
+                line = read()
+                if line == '':
+                    break
+
+                line = line.rstrip("\r\n").decode('euc-jp')
+
+                if line[0] == '0':
+                    break
+                elif line[0] == '1':
+                    result = skkserv_cmd1(conns, line[1:]) + "\n"
+                elif line[0] == '2':
+                    result = version + ' '
+                elif line[0] == '3':
+                    result = host_info + ' '
+                elif line[0] == '4':
+                    result = skkserv_cmd4(conns, line[1:]) + "\n"
+                else:
+                    result = "0"
+
+                result = result.encode('euc-jp')
+            except:
+                result = "0"
+
+            write(result)
+
+    finally:
+        for conn in conns:
+            conn.close()
+
+
+def inetd_main(files):
+    def write(s):
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    skkserv_main(lambda: sys.stdin.readline(), write, files, __version__,
+                 'inetd')
+
+
+def skkserv_thread(sock, files):
+    host_info = socket.gethostname()
+    if sock.family == socket.AF_INET:
+        host_info += ':' + sock.getsockname()[0] + ':'
+    else:
+        host_info += ':[' + sock.getsockname()[0] + ']:'
+
+    skkserv_main(lambda: sock.recv(4096), lambda s: sock.send(s), files,
+                 __version__, host_info)
+    sock.close()
+
+
+def server_main(addrinfo, files):
+    socks = []
+
+    try:
+        for (af, socktype, proto, canonname, sa) in addrinfo:
+            s = socket.socket(af, socktype, proto)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(sa)
+            s.listen(5)
+            socks.append(s)
+    except Exception as e:
+        sys.stderr.write("can't start SKK server: {}\n".format(str(e)))
+        exit(1)
+
+    while True:
+        try:
+            # timeout in a second to avoid signal blocking
+            r, w, e = select.select(socks, [], [], 1.0)
+
+            for s in r:
+                s1, addr = s.accept()
+
+                thread = threading.Thread(target=skkserv_thread,
+                                          args=(s1, files))
+                thread.daemon = True
+                thread.start()
+        except:
+            break
+
+    for s in socks:
+        s.close()
+
+
+def create_main(jisyo, sqlite3_jisyo):
+    conn = sqlite3.connect(sqlite3_jisyo)
+
+    create_table(conn)
+
+    cur = conn.cursor()
+
+    with open(jisyo) as f:
+        okuri_ari = 0
+
+        for line in f:
+            try:
+                line = line.decode('euc-jp').rstrip()
+            except UnicodeError:
+                continue
+
+            if line == '':
+                continue
+
+            if line.startswith(';'):
+                if line == ";; okuri-ari entries.":
+                    okuri_ari = 1
+                elif line == ";; okuri-nasi entries.":
+                    okuri_ari = 0
+                continue
+
+            key, val = line.split(' ', 1)
+            record = val.split('/')
+
+            for candidate in record[1:-1]:
+                try:
+                    cand, anno = candidate.split(';')
+                except ValueError:
+                    cand, anno = (candidate, "")
+
+                cur.execute("INSERT INTO jisyo VALUES (NULL, ?, ?, ?, ?);",
+                            (key, cand, anno, okuri_ari))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+if __name__ == '__main__':
+    usage = (
+        "\n"
+        "  %(prog)s [options] [SKK-JISYO.sqlite ...]\n"
+        "  %(prog)s -c SKK-JISYO [SKK-JISYO.sqlite]"
+    )
+
+    parser = argparse.ArgumentParser(usage=usage)
+    parser.add_argument('-4', action='store_true', help='listen on IPv4 only')
+    parser.add_argument('-6', action='store_true', help='listen on IPv6 only')
+    parser.add_argument('-P', metavar='PIDFILE',
+                        help='write the process id to PIDFILE')
+    parser.add_argument('-b', metavar='HOST', default=None, help='bind to HOST')
+    parser.add_argument('-c', metavar='SKK-JISYO',
+                        help='create SKK-JISYO.sqlite from SKK-JISYO')
+    parser.add_argument('-d', action='store_true', help='run as daemon mode')
+    parser.add_argument('-f', action='store_true',
+                        help='run as foreground mode')
+    parser.add_argument('-p', metavar='PORT', default=1178, type=int,
+                        help='port to listen on (default is 1178)')
+    parser.add_argument('-u', metavar='USER[:GROUP]',
+                        help='setuid to USER on daemon mode')
+    parser.add_argument('-v', action='version',
+                        version=('%(prog)s ' + __version__))
+    parser.add_argument('SKK-JISYO.sqlite', nargs='*',
+                        help='SKK-JISYO for skkserv-lite')
+    args = vars(parser.parse_args())
+
+    if args['c']:
+        if not args['SKK-JISYO.sqlite']:
+            sqlite3_jisyo = args['c'] + '.sqlite'
+        elif len(args['SKK-JISYO.sqlite']) == 1:
+            sqlite3_jisyo = args['SKK-JISYO.sqlite'][0]
+        else:
+            sys.stderr.write('too many arguments\n')
+            exit(1)
+
+        create_main(args['c'], sqlite3_jisyo)
+        exit(0)
+
+    jisyo_files = [os.path.abspath(os.path.expanduser(os.path.expandvars(j)))
+                   for j in args['SKK-JISYO.sqlite']]
+
+    for j in jisyo_files:
+        if not os.access(j, os.R_OK):
+            sys.stderr.write("{} No such file or directory\n".format(j))
+            exit(1)
+
+    if args['d'] or args['f']:
+        if args['4']:
+            family = socket.AF_INET
+        elif args['6']:
+            family = socket.AF_INET6
+        else:
+            family = socket.AF_UNSPEC
+
+        addrinfo = socket.getaddrinfo(args['b'], args['p'], family,
+                                      socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+
+        if args['d']:
+            if daemon is None or lockfile is None:
+                sys.stderr.write("These modules are required for daemon mode: "
+                                 "daemon, lockfile\n")
+                exit(1)
+
+            if args['P']:
+                pidfile = lockfile.pidlockfile.PIDLockFile(args['P'])
+            else:
+                pidfile = None
+
+            if args['u'] and pwd is not None and grp is not None:
+                try:
+                    user, group = args['u'].split(':', 1)
+                except ValueError:
+                    user = args['u']
+                    group = None
+
+                try:
+                    uid = int(user)
+                except ValueError:
+                    uid = pwd.getpwnam(user).pw_uid
+
+                if group is None:
+                    gid = pwd.getpwuid(uid).pw_gid
+                else:
+                    try:
+                        gid = int(group)
+                    except ValueError:
+                        gid = grp.getgrnam(group).gr_gid
+            else:
+                uid = os.getuid()
+                gid = os.getgid()
+
+            with daemon.DaemonContext(pidfile=pidfile, uid=uid, gid=gid):
+                server_main(addrinfo, jisyo_files)
+        else:
+            server_main(addrinfo, jisyo_files)
+    else:
+        inetd_main(jisyo_files)
+
