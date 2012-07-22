@@ -9,7 +9,7 @@ setup(
     name='skkserv-lite',
     version='1.0',
     author='INAJIMA Daisuke',
-    email='inajima@sopht.jp',
+    author_email='inajima@sopht.jp',
     description='SKK server using sqlite3 dictionaries',
     scripts=['skkserv-lite'],
     license='MIT',
