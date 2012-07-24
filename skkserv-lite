@@ -216,43 +216,44 @@ def server_main(addrinfo, files):
         s.close()
 
 
-def create_main(jisyo, sqlite3_jisyo):
+def create_main(sqlite3_jisyo, jisyo_files):
     conn = sqlite3.connect(sqlite3_jisyo)
 
     create_table(conn)
 
     cur = conn.cursor()
 
-    with open(jisyo) as f:
-        okuri_ari = 0
+    for jisyo in jisyo_files:
+        with open(jisyo) as f:
+            okuri_ari = 0
 
-        for line in f:
-            try:
-                line = line.decode('euc-jp').rstrip()
-            except UnicodeError:
-                continue
-
-            if line == '':
-                continue
-
-            if line.startswith(';'):
-                if line == ";; okuri-ari entries.":
-                    okuri_ari = 1
-                elif line == ";; okuri-nasi entries.":
-                    okuri_ari = 0
-                continue
-
-            key, val = line.split(' ', 1)
-            record = val.split('/')
-
-            for candidate in record[1:-1]:
+            for line in f:
                 try:
-                    cand, anno = candidate.split(';')
-                except ValueError:
-                    cand, anno = (candidate, "")
+                    line = line.decode('euc-jp').rstrip()
+                except UnicodeError:
+                    continue
 
-                cur.execute("INSERT INTO jisyo VALUES (NULL, ?, ?, ?, ?);",
-                            (key, cand, anno, okuri_ari))
+                if line == '':
+                    continue
+
+                if line.startswith(';'):
+                    if line == ";; okuri-ari entries.":
+                        okuri_ari = 1
+                    elif line == ";; okuri-nasi entries.":
+                        okuri_ari = 0
+                    continue
+
+                key, val = line.split(' ', 1)
+                record = val.split('/')
+
+                for candidate in record[1:-1]:
+                    try:
+                        cand, anno = candidate.split(';')
+                    except ValueError:
+                        cand, anno = (candidate, "")
+
+                    cur.execute("INSERT INTO jisyo VALUES (NULL, ?, ?, ?, ?);",
+                                (key, cand, anno, okuri_ari))
 
     conn.commit()
 
@@ -264,20 +265,26 @@ if __name__ == '__main__':
     usage = (
         "\n"
         "  %(prog)s [options] [SKK-JISYO.sqlite ...]\n"
-        "  %(prog)s -c SKK-JISYO [SKK-JISYO.sqlite]"
+        "  %(prog)s -C [-o SKK-JISYO.sqlite] SKK-JISYO [SKK-JISYO ...]"
     )
 
     parser = argparse.ArgumentParser(usage=usage)
     parser.add_argument('-4', action='store_true', help='listen on IPv4 only')
     parser.add_argument('-6', action='store_true', help='listen on IPv6 only')
+    parser.add_argument('-C', action='store_true',
+                        help='create SKK-JISYO.sqlite from SKK-JISYO')
     parser.add_argument('-P', metavar='PIDFILE',
                         help='write the process id to PIDFILE')
     parser.add_argument('-b', metavar='HOST', default=None, help='bind to HOST')
     parser.add_argument('-c', metavar='SKK-JISYO',
-                        help='create SKK-JISYO.sqlite from SKK-JISYO')
+                        help='create SKK-JISYO.sqlite from SKK-JISYO '
+                             '(deprecated)')
     parser.add_argument('-d', action='store_true', help='run as daemon mode')
     parser.add_argument('-f', action='store_true',
                         help='run as foreground mode')
+    parser.add_argument('-o', metavar='SKK-JISYO.sqlite',
+                        help='sqlite3 dictionary to create '
+                             '(default is SKK-JISYO.sqlite)')
     parser.add_argument('-p', metavar='PORT', default=1178, type=int,
                         help='port to listen on (default is 1178)')
     parser.add_argument('-u', metavar='USER[:GROUP]',
@@ -288,16 +295,30 @@ if __name__ == '__main__':
                         help='SKK-JISYO for skkserv-lite')
     args = vars(parser.parse_args())
 
-    if args['c']:
-        if not args['SKK-JISYO.sqlite']:
-            sqlite3_jisyo = args['c'] + '.sqlite'
-        elif len(args['SKK-JISYO.sqlite']) == 1:
-            sqlite3_jisyo = args['SKK-JISYO.sqlite'][0]
-        else:
-            sys.stderr.write('too many arguments\n')
-            exit(1)
+    if args['C'] or args['c']:
+        if args['C']:
+            if not args['o']:
+                sqlite3_jisyo = 'SKK-JISYO.sqlite'
+            else:
+                sqlite3_jisyo = args['o']
 
-        create_main(args['c'], sqlite3_jisyo)
+            if not args['SKK-JISYO.sqlite']:
+                sys.stderr.write('no SKK-JISYO is specified\n')
+                exit(1)
+
+            jisyo_files = args['SKK-JISYO.sqlite']
+        else:
+            if not args['SKK-JISYO.sqlite']:
+                sqlite3_jisyo = args['c'] + '.sqlite'
+                jisyo_files = [args['c']]
+            elif len(args['SKK-JISYO.sqlite']) == 1:
+                sqlite3_jisyo = args['SKK-JISYO.sqlite'][0]
+                jisyo_files = [args['c']]
+            else:
+                sys.stderr.write('too many arguments\n')
+                exit(1)
+
+        create_main(sqlite3_jisyo, jisyo_files)
         exit(0)
 
     jisyo_files = [os.path.abspath(os.path.expanduser(os.path.expandvars(j)))
