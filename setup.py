@@ -7,7 +7,7 @@ except:
 
 setup(
     name='skkserv-lite',
-    version='1.0',
+    version='1.1',
     author='INAJIMA Daisuke',
     author_email='inajima@sopht.jp',
     description='SKK server using sqlite3 dictionaries',
