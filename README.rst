@@ -4,6 +4,9 @@ skkserv-lite
 skkserv-lite は sqlite3 形式の辞書を使用する SKK サーバです。
 複数辞書の使用および、サーバコンプリーションに対応しています。
 
+.. note::
+
+  https://github.com/anyakichi/ocaml-skkserv-lite が現在の最新バージョンです。
 
 インストール
 ------------
